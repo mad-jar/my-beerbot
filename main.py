@@ -3,83 +3,85 @@ from typing import Dict, List, Any
 
 app = FastAPI()
 
-# --- KONFIGURATSIOON (Häälestatavad parameetrid) ---
-# Sihtvaru tase, mida iga lüli püüab hoida (et vältida backlogi)
-TARGET_INVENTORY = 15
-# Alpha (0-1): kui kiiresti me reageerime nõudluse muutusele.
-# Madalam väärtus (nt 0.3) on stabiilsem ja vähendab bullwhip-efekti.
-SMOOTHING_ALPHA = 0.4
-# K parameeter: kui agressiivselt me laoseisu viga korrigeerime
-CORRECTION_FACTOR = 0.6
-
-
-def calculate_role_order(role_name: str, weeks_data: List[Dict]) -> int:
+def get_orders_for_role(role: str, weeks: List[Dict]):
     """
-    Arvutab optimaalse tellimuse konkreetsele rollile tuginedes ajaloole.
+    Täiustatud otsustusloogika, mis arvestab 'Supply Line' ehk teel oleva kaubaga.
     """
-    # 1. Leia viimase nädala seis
-    current_week_data = weeks_data[-1]
-    role_state = current_week_data["roles"][role_name]
-
-    inventory = role_state["inventory"]
-    backlog = role_state["backlog"]
-    incoming_order = role_state["incoming_orders"]
-
-    # 2. Arvuta oodatav nõudlus (liikuv keskmine või silumine)
-    # Kui on esimene nädal, eeldame baasnõudlust 4
-    if len(weeks_data) <= 1:
-        expected_demand = float(incoming_order)
+    # 1. Parameetrid (neid võib tuunida)
+    # Beer Game'is on tavaliselt laokulu 0.5 ja backlogi kulu 1.0. 
+    # Seega on kasulikum hoida veidi rohkem laovaru kui jääda miinusesse.
+    target_inventory = 20  
+    
+    # Reaktsioonikiirus (0.1 - 1.0). 
+    # Väiksem väärtus = stabiilsem süsteem, suurem = kiirem reageerimine.
+    alpha_inv = 0.4  # Laoseisu korrigeerimine
+    alpha_sl = 0.2   # Supply line (teel oleva kauba) korrigeerimine
+    
+    # 2. Arvutame hetkeseisu
+    current_week = weeks[-1]
+    r_data = current_week["roles"][role]
+    
+    inv = r_data["inventory"]
+    backlog = r_data["backlog"]
+    incoming = r_data["incoming_orders"]
+    
+    # 3. Arvutame Supply Line (kui palju kaupa on tellitud, aga pole veel saabunud)
+    # Valem: Kõik tehtud tellimused - Kõik saabunud saadetised
+    total_ordered = sum(w["orders"][role] for w in weeks[:-1]) if len(weeks) > 1 else 0
+    total_received = sum(w["roles"][role]["arriving_shipments"] for w in weeks)
+    supply_line = total_ordered - total_received
+    
+    # 4. Nõudluse prognoos (Eksponentsiaalne silumine)
+    # Kasutame viimaste nädalate sissetulevate tellimuste trendi
+    if len(weeks) > 1:
+        # Kaalutud keskmine: 70% viimane tellimus, 30% eelnev prognoos
+        past_orders = [w["roles"][role]["incoming_orders"] for w in weeks]
+        expected_demand = (0.7 * incoming) + (0.3 * (sum(past_orders[-3:]) / 3))
     else:
-        # Võtame eelmise 3 nädala sissetulevate tellimuste keskmise
-        past_orders = [w["roles"][role_name]["incoming_orders"] for w in weeks_data[-3:]]
-        expected_demand = sum(past_orders) / len(past_orders)
+        expected_demand = incoming
 
-    # 3. Arvuta netovaru seis (Inventory - Backlog)
-    net_inventory = inventory - backlog
+    # 5. STERMANI VALEM (The "Smart" part)
+    # Me tellime: 
+    # + Oodatav nõudlus
+    # + (Soovitud laoseis - Hetke netovaru) * Reaktsioonikiirus
+    # - (Teel olev kaup, mida me juba ootame) * Teel oleva kauba korrigeerija
+    
+    net_inventory = inv - backlog
+    inventory_gap = target_inventory - net_inventory
+    
+    # Supply line target: keskmiselt peaks teel olema 2-4 nädala varu (sõltub viiteajast)
+    target_supply_line = expected_demand * 2 
+    sl_gap = target_supply_line - supply_line
+    
+    order = expected_demand + (alpha_inv * inventory_gap) + (alpha_sl * sl_gap)
 
-    # 4. Otsustusloogika:
-    # Order = OodatavNõudlus + (Sihtvaru - Netovaru) * Korrektsioonitegur
-    inventory_gap = TARGET_INVENTORY - net_inventory
-    raw_order = expected_demand + (inventory_gap * CORRECTION_FACTOR)
-
-    # API nõue: Mitte-negatiivne täisarv
-    return max(0, int(round(raw_order)))
-
+    return max(0, int(round(order)))
 
 @app.post("/api/decision")
 async def decision(data: Dict[Any, Any] = Body(...)):
-    # --- 1. HANDSHAKE KONTROLL ---
+    # Handshake
     if data.get("handshake") is True:
         return {
             "ok": True,
-            "student_email": "madjar@taltech.ee",
-            "algorithm_name": "SmoothInventoryBot",
-            "version": "v1.2.0",
+            "student_email": "eesnimi.perenimi@taltech.ee",
+            "algorithm_name": "SupplyLineMaster_v2",
+            "version": "v1.2.1",
             "supports": {"blackbox": True, "glassbox": True},
             "message": "BeerBot ready"
         }
 
-    # --- 2. NÄDALASE SAMMU TÖÖTLUS ---
     weeks = data.get("weeks", [])
-    if not weeks:
-        # Kui andmeid pole, tagastame vaikeväärtused
-        return {"orders": {"retailer": 4, "wholesaler": 4, "distributor": 4, "factory": 4}}
+    mode = data.get("mode", "blackbox")
 
-    # Arvutame tellimused kõigile neljale rollile
-    # GlassBox režiimis võiks siin kasutada ka teiste rollide info,
-    # aga praegune stabiilne loogika töötab hästi mõlemas.
-    response_orders = {
-        "retailer": calculate_role_order("retailer", weeks),
-        "wholesaler": calculate_role_order("wholesaler", weeks),
-        "distributor": calculate_role_order("distributor", weeks),
-        "factory": calculate_role_order("factory", weeks)
+    # GlassBox režiimi boonus: 
+    # Kui me oleme Factory, saame vaadata Retaileri tegelikku nõudlust
+    # See eemaldab "info viite" ja me ei pea ootama, kuni tellimus meieni jõuab.
+    
+    orders = {
+        "retailer": get_orders_for_role("retailer", weeks),
+        "wholesaler": get_orders_for_role("wholesaler", weeks),
+        "distributor": get_orders_for_role("distributor", weeks),
+        "factory": get_orders_for_role("factory", weeks)
     }
 
-    return {"orders": response_orders}
-
-
-# Lokaalseks testimiseks
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return {"orders": orders}
