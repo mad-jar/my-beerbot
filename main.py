@@ -52,7 +52,7 @@ async def decision(data: Dict[Any, Any] = Body(...)):
     if data.get("handshake") is True:
         return {
             "ok": True,
-            "student_email": "eesnimi.perenimi@taltech.ee",  # MUUDA SEDA!
+            "student_email": "madjar@taltech.ee",
             "algorithm_name": "SmoothInventoryBot",
             "version": "v1.2.0",
             "supports": {"blackbox": True, "glassbox": True},
